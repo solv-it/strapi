@@ -1,7 +1,7 @@
 'use strict';
 
 const _ = require('lodash');
-const { each, prop, reject, isEmpty } = require('lodash/fp');
+const { keys, each, prop, isEmpty } = require('lodash/fp');
 const { singular } = require('pluralize');
 const { toQueries, runPopulateQueries } = require('./utils/populate-queries');
 
@@ -14,15 +14,28 @@ const BOOLEAN_OPERATORS = ['or'];
  * @param {Object} options.filters - Filters params (start, limit, sort, where)
  */
 const buildQuery = ({ model, filters }) => qb => {
-  if (_.has(filters, 'where') && Array.isArray(filters.where) && filters.where.length > 0) {
+  const joinsTree = buildJoinsAndFilter(qb, model, filters);
+
+  const isSortQuery = _.has(filters, 'sort');
+
+  const isSingleResult = _.has(filters, 'limit') && filters.limit === 1;
+  const hasJoins = _.has(joinsTree, 'joins') && keys(joinsTree.joins).length;
+  const isDistinctJoin = !isSingleResult && hasJoins;
+  const hasWhereFilters =
+    _.has(filters, 'where') && Array.isArray(filters.where) && filters.where.length > 0;
+
+  const isDistinctQuery = isDistinctJoin && (isSortQuery || hasWhereFilters);
+  if (isDistinctQuery) {
     qb.distinct();
   }
 
-  const joinsTree = buildJoinsAndFilter(qb, model, filters);
+  if (isSortQuery) {
+    const clauses = filters.sort.map(buildSortClauseFromTree(joinsTree)).filter(c => !isEmpty(c));
+    const orderBy = clauses.map(({ order, alias }) => ({ order, column: alias }));
+    const orderColumns = clauses.map(({ alias, column }) => ({ [alias]: column }));
+    const columns = [`${joinsTree.alias}.*`, ...orderColumns];
 
-  if (_.has(filters, 'sort')) {
-    const clauses = filters.sort.map(buildSortClauseFromTree(joinsTree));
-    qb.orderBy(reject(isEmpty, clauses));
+    qb.column(columns).orderBy(orderBy);
   }
 
   if (_.has(filters, 'start')) {
@@ -47,13 +60,21 @@ const buildQuery = ({ model, filters }) => qb => {
  */
 const buildSortClauseFromTree = tree => ({ field, order }) => {
   if (!field.includes('.')) {
-    return { column: field, order };
+    return {
+      column: `${tree.alias}.${field}`,
+      order,
+      alias: `_strapi_tmp_${tree.alias}_${field}`,
+    };
   }
 
   const [relation, attribute] = field.split('.');
   for (const { alias, assoc } of Object.values(tree.joins)) {
     if (relation === assoc.alias) {
-      return { column: `${alias}.${attribute}`, order };
+      return {
+        column: `${alias}.${attribute}`,
+        order,
+        alias: `_strapi_tmp_${alias}_${attribute}`,
+      };
     }
   }
 
@@ -315,9 +336,9 @@ const buildWhereClause = ({ qb, field, operator, value }) => {
     case 'nin':
       return qb.whereNotIn(field, Array.isArray(value) ? value : [value]);
     case 'contains':
-      return qb.whereRaw('LOWER(??) LIKE LOWER(?)', [field, `%${value}%`]);
+      return qb.whereRaw(`${fieldLowerFn(qb)} LIKE LOWER(?)`, [field, `%${value}%`]);
     case 'ncontains':
-      return qb.whereRaw('LOWER(??) NOT LIKE LOWER(?)', [field, `%${value}%`]);
+      return qb.whereRaw(`${fieldLowerFn(qb)} NOT LIKE LOWER(?)`, [field, `%${value}%`]);
     case 'containss':
       return qb.where(field, 'like', `%${value}%`);
     case 'ncontainss':
@@ -329,6 +350,14 @@ const buildWhereClause = ({ qb, field, operator, value }) => {
     default:
       throw new Error(`Unhandled whereClause : ${field} ${operator} ${value}`);
   }
+};
+
+const fieldLowerFn = qb => {
+  // Postgres requires string to be passed
+  if (qb.client.config.client === 'pg') {
+    return 'LOWER(CAST(?? AS VARCHAR))';
+  }
+  return 'LOWER(??)';
 };
 
 const findAssoc = (model, key) => model.associations.find(assoc => assoc.alias === key);
